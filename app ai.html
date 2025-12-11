@@ -390,7 +390,9 @@
         function setMode(mode) {
             currentMode = mode;
             document.querySelectorAll('.tool-btn').forEach(btn => btn.classList.remove('active'));
-            event.target.classList.add('active');
+            // Utilisez event.currentTarget si la fonction est attachée via addEventListener, 
+            // mais ici event.target est OK car c'est un onclick direct sur le bouton.
+            document.querySelector(`.tool-btn[onclick*="${mode}"]`).classList.add('active');
             
             const placeholders = {
                 chat: 'Écrivez votre message...',
@@ -450,11 +452,14 @@
             container.appendChild(messageDiv);
             container.scrollTop = container.scrollHeight;
             
-            conversationHistory.push({ role, content });
+            // On enregistre seulement si c'est un vrai message (pas le message initial)
+            if (conversationHistory.length > 0 || role === 'user') { 
+                conversationHistory.push({ role, content });
+            }
         }
 
         function formatMessage(content) {
-            // Formatter le code
+            // Formatter le code (blocs de code)
             content = content.replace(/```(\w+)?\n([\s\S]*?)```/g, (match, lang, code) => {
                 return `<div class="code-block"><code>${escapeHtml(code.trim())}</code></div>`;
             });
@@ -462,7 +467,7 @@
             // Formatter le code inline
             content = content.replace(/`([^`]+)`/g, '<code style="background: rgba(0,0,0,0.3); padding: 2px 6px; border-radius: 4px;">$1</code>');
             
-            // Formatter les liens
+            // Formatter les liens (Markdown)
             content = content.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
             
             // Sauts de ligne
@@ -505,11 +510,15 @@
             
             // Mode local / demo
             if (provider === 'local' || !apiKey) {
+                updateStatus(true, 'Mode Demo');
                 return getLocalResponse(message);
             }
             
             // Ajouter contexte selon le mode
             let systemPrompt = getSystemPrompt();
+            
+            // Simuler un délai réseau
+            await new Promise(resolve => setTimeout(resolve, 1500)); 
             
             try {
                 if (provider === 'openai') {
@@ -519,7 +528,9 @@
                 } else if (provider === 'google') {
                     return await callGoogle(message, systemPrompt, apiKey);
                 }
+                throw new Error("Fournisseur IA inconnu.");
             } catch (error) {
+                updateStatus(false);
                 throw error;
             }
         }
@@ -528,7 +539,7 @@
             const prompts = {
                 chat: "Tu es un assistant IA helpful, précis et amical. Réponds en français.",
                 search: "Tu es un assistant de recherche. Fournis des informations détaillées et sourcées. Réponds en français.",
-                code: "Tu es un expert en programmation. Fournis du code propre et bien commenté. Explique ton code.",
+                code: "Tu es un expert en programmation. Fournis du code propre et bien commenté. Explique ton code. Utilise des blocs de code markdown (```).",
                 translate: "Tu es un traducteur professionnel. Traduis le texte de manière précise et naturelle."
             };
             return prompts[currentMode] || prompts.chat;
@@ -545,8 +556,9 @@
                     model: API_CONFIG.openai.model,
                     messages: [
                         { role: 'system', content: systemPrompt },
-                        ...conversationHistory.slice(-10).map(m => ({
-                            role: m.role === 'user' ? 'user' : 'assistant',
+                        // Limiter l'historique de conversation (les 10 dernières paires)
+                        ...conversationHistory.slice(-20).map(m => ({
+                            role: m.role,
                             content: m.content
                         })),
                         { role: 'user', content: message }
@@ -566,25 +578,27 @@
         }
 
         async function callAnthropic(message, systemPrompt, apiKey) {
+            const messages = [
+                ...conversationHistory.slice(-20).map(m => ({
+                    role: m.role,
+                    content: m.content
+                })),
+                { role: 'user', content: message }
+            ];
+            
             const response = await fetch(API_CONFIG.anthropic.url, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                     'x-api-key': apiKey,
                     'anthropic-version': '2023-06-01',
-                    'anthropic-dangerous-direct-browser-access': 'true'
+                    'anthropic-dangerous-direct-browser-access': 'true' // Requis pour les appels cross-origin depuis un navigateur
                 },
                 body: JSON.stringify({
                     model: API_CONFIG.anthropic.model,
                     max_tokens: 2000,
                     system: systemPrompt,
-                    messages: [
-                        ...conversationHistory.slice(-10).map(m => ({
-                            role: m.role === 'user' ? 'user' : 'assistant',
-                            content: m.content
-                        })),
-                        { role: 'user', content: message }
-                    ]
+                    messages: messages
                 })
             });
             
@@ -601,28 +615,52 @@
         async function callGoogle(message, systemPrompt, apiKey) {
             const url = `${API_CONFIG.google.url}?key=${apiKey}`;
             
+            // Gemini (via generateContent) utilise un format d'historique légèrement différent,
+            // et le 'system' prompt est souvent ajouté en tête.
+            const contents = [
+                {
+                    parts: [{
+                        text: systemPrompt
+                    }],
+                    role: "model" // Simuler le system prompt comme un message du modèle
+                },
+                // Ajouter les messages précédents pour la continuité de la conversation
+                ...conversationHistory.slice(-20).map(m => ({
+                    parts: [{ text: m.content }],
+                    role: m.role === 'user' ? 'user' : 'model'
+                })),
+                // Ajouter le message actuel
+                {
+                    parts: [{ text: message }],
+                    role: "user"
+                }
+            ];
+
             const response = await fetch(url, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({
-                    contents: [{
-                        parts: [{
-                            text: `${systemPrompt}\n\nUtilisateur: ${message}`
-                        }]
-                    }]
+                    contents: contents
                 })
             });
             
             if (!response.ok) {
                 const error = await response.json();
-                throw new Error(error.error?.message || 'Erreur API Google');
+                // Tenter d'extraire le message d'erreur si disponible
+                const errorMessage = error.error?.message || JSON.stringify(error) || 'Erreur API Google';
+                throw new Error(errorMessage);
             }
             
             const data = await response.json();
             updateStatus(true);
-            return data.candidates[0].content.parts[0].text;
+            // Vérifier si la réponse est valide
+            if (data.candidates && data.candidates.length > 0 && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts.length > 0) {
+                return data.candidates[0].content.parts[0].text;
+            } else {
+                return 'Réponse de l\'API invalide ou bloquée. Veuillez vérifier votre clé et votre requête.';
+            }
         }
 
         function getLocalResponse(message) {
@@ -640,7 +678,8 @@
 \`\`\`javascript
 // Exemple de code
 function exemple() {
-    console.log("Hello World!");
+    console.log("Ceci est un exemple de code JavaScript.");
+    // ${message.slice(0, 30)}...
     return true;
 }
 \`\`\`
@@ -653,7 +692,7 @@ ${localKnowledge.responses.default}`;
 
 <div class="search-results">
     <h4>🔍 Résultats pour: "${message}"</h4>
-    <p>Mode démonstration - Connectez une API pour de vrais résultats</p>
+    <p>Le mode démonstration ne fournit pas de résultats en direct. Connectez une API pour activer la recherche web.</p>
 </div>
 
 ${localKnowledge.responses.default}`;
@@ -662,7 +701,8 @@ ${localKnowledge.responses.default}`;
             if (currentMode === 'translate') {
                 return `${localKnowledge.responses.translate}
 
-"${message}"
+**Texte original:** "${message}"
+**Traduction (Exemple):** "This is a demonstration of translation capabilities."
 
 ${localKnowledge.responses.default}`;
             }
@@ -681,23 +721,23 @@ ${localKnowledge.responses.default}`;
             const tips = `
 
 💡 **Conseils:**
-- Obtenez une clé API gratuite sur [OpenAI](https://platform.openai.com)
-- Ou utilisez [Google AI Studio](https://makersuite.google.com) pour Gemini
+- Obtenez une clé API gratuite sur [Google AI Studio](https://makersuite.google.com) pour Gemini
+- Vous pouvez aussi utiliser une clé [OpenAI](https://platform.openai.com) ou [Anthropic](https://www.anthropic.com)
 - Collez votre clé dans les paramètres ci-dessous`;
             
             return responses[Math.floor(Math.random() * responses.length)] + tips;
         }
 
-        function updateStatus(connected) {
+        function updateStatus(connected, statusText = null) {
             const dot = document.getElementById('statusDot');
             const text = document.getElementById('statusText');
             
             if (connected) {
                 dot.classList.add('connected');
-                text.textContent = 'Connecté';
+                text.textContent = statusText || 'Connecté';
             } else {
                 dot.classList.remove('connected');
-                text.textContent = 'Non connecté';
+                text.textContent = statusText || 'Non connecté';
             }
         }
 
@@ -715,8 +755,7 @@ ${localKnowledge.responses.default}`;
             document.getElementById('apiKey').placeholder = placeholders[provider];
             
             if (provider === 'local') {
-                updateStatus(true);
-                document.getElementById('statusText').textContent = 'Mode Demo';
+                updateStatus(true, 'Mode Demo');
             }
         }
 
@@ -731,10 +770,13 @@ ${localKnowledge.responses.default}`;
         // Sauvegarder la clé API en local
         document.getElementById('apiKey').addEventListener('change', function() {
             localStorage.setItem('ai_api_key', this.value);
+            // Mettre à jour le statut immédiatement
+            updateStatus(false); 
         });
 
         document.getElementById('provider').addEventListener('change', function() {
             localStorage.setItem('ai_provider', this.value);
+            updateProvider();
         });
 
         // Charger les paramètres sauvegardés
@@ -748,6 +790,17 @@ ${localKnowledge.responses.default}`;
                 document.getElementById('provider').value = savedProvider;
                 updateProvider();
             }
+            
+            // Mise à jour initiale du fournisseur et du statut
+            updateProvider();
+
+            // S'assurer que le message de bienvenue est présent après le chargement
+            if (document.getElementById('chatContainer').children.length === 0) {
+                 addMessage("Bonjour ! Je suis votre assistant IA. Je peux vous aider avec : <br><br> 💬 <strong>Conversation</strong> - Discuter de n'importe quel sujet<br> 🔍 <strong>Recherche Web</strong> - Trouver des informations en ligne<br> 💻 <strong>Code</strong> - Écrire et expliquer du code<br> 🌍 <strong>Traduction</strong> - Traduire du texte<br><br> Configurez votre clé API ci-dessous, puis posez-moi vos questions !", 'assistant');
+            }
+            
+            // Activer le mode chat par défaut au chargement
+            document.querySelector('.tool-btn[onclick*="chat"]').classList.add('active');
         };
     </script>
 </body>
